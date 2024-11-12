@@ -9,6 +9,7 @@ ATTR_CURRENT_POSITION: Final[str] = "current_position"
 ATTR_CURRENT_TILT_POSITION: Final[str] = "current_tilt_position"
 ATTR_POSITION: Final[str] = "position"
 ATTR_TILT_POSITION: Final[str] = "tilt_position"
+ATTR_SUPPORTED_FEATURES: Final[str] = "supported_features"
 
 STATE_OPEN: Final = "open"
 STATE_OPENING: Final = "opening"

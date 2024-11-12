@@ -2,19 +2,23 @@
 
 from __future__ import annotations
 
+from abc import ABC
 import asyncio
 import functools
 import logging
 from typing import TYPE_CHECKING, Any, Literal, cast
 
+from zigpy.zcl.clusters.closures import WindowCovering
 from zigpy.zcl.clusters.general import OnOff
 from zigpy.zcl.foundation import Status
 
 from zha.application import Platform
-from zha.application.platforms import PlatformEntity
+from zha.application.platforms import BaseEntity, GroupEntity, PlatformEntity
 from zha.application.platforms.cover.const import (
     ATTR_CURRENT_POSITION,
+    ATTR_CURRENT_TILT_POSITION,
     ATTR_POSITION,
+    ATTR_SUPPORTED_FEATURES,
     ATTR_TILT_POSITION,
     STATE_CLOSED,
     STATE_CLOSING,
@@ -39,6 +43,11 @@ from zha.zigbee.cluster_handlers.const import (
     CLUSTER_HANDLER_SHADE,
 )
 from zha.zigbee.cluster_handlers.general import LevelChangeEvent
+from zha.zigbee.group import Group
+from zha.application.platforms.helpers import (
+    find_state_attributes,
+    mean_int,
+)
 
 if TYPE_CHECKING:
     from zha.zigbee.cluster_handlers import ClusterHandler
@@ -47,58 +56,27 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 
+GROUP_MATCH = functools.partial(PLATFORM_ENTITIES.group_match, Platform.COVER)
 MULTI_MATCH = functools.partial(PLATFORM_ENTITIES.multipass_match, Platform.COVER)
 
 
-@MULTI_MATCH(cluster_handler_names=CLUSTER_HANDLER_COVER)
-class Cover(PlatformEntity):
-    """Representation of a ZHA cover."""
+class BaseCover(BaseEntity, ABC):
+    """Common base class for ZHA covers."""
 
     PLATFORM = Platform.COVER
 
-    _attr_translation_key: str = "cover"
-    _attr_extra_state_attribute_names: set[str] = {
-        "target_lift_position",
-        "target_tilt_position",
-    }
-
     def __init__(
         self,
-        unique_id: str,
-        cluster_handlers: list[ClusterHandler],
-        endpoint: Endpoint,
-        device: Device,
-        **kwargs,
-    ) -> None:
-        """Init this cover."""
-        super().__init__(unique_id, cluster_handlers, endpoint, device, **kwargs)
-        cluster_handler = self.cluster_handlers.get(CLUSTER_HANDLER_COVER)
-        assert cluster_handler
-        self._cover_cluster_handler: WindowCoveringClusterHandler = cast(
-            WindowCoveringClusterHandler, cluster_handler
-        )
-        if self._cover_cluster_handler.window_covering_type:
-            self._attr_device_class: CoverDeviceClass | None = (
-                ZCL_TO_COVER_DEVICE_CLASS.get(
-                    self._cover_cluster_handler.window_covering_type
-                )
-            )
-        self._attr_supported_features: CoverEntityFeature = (
-            self._determine_supported_features()
-        )
+        *args: Any,
+        **kwargs: Any,
+    ):
+        """Initialize the cover."""
+        self._cover_cluster_handler: WindowCoveringClusterHandler
+        self._attr_supported_features: CoverEntityFeature
         self._target_lift_position: int | None = None
         self._target_tilt_position: int | None = None
         self._state: str = STATE_OPEN
-        self._determine_initial_state()
-        self._cover_cluster_handler.on_event(
-            CLUSTER_HANDLER_ATTRIBUTE_UPDATED,
-            self.handle_cluster_handler_attribute_updated,
-        )
-
-    @property
-    def supported_features(self) -> CoverEntityFeature:
-        """Return supported features."""
-        return self._attr_supported_features
+        super().__init__(*args, **kwargs)
 
     @property
     def state(self) -> dict[str, Any]:
@@ -113,9 +91,15 @@ class Cover(PlatformEntity):
                 "is_closed": self.is_closed,
                 "target_lift_position": self._target_lift_position,
                 "target_tilt_position": self._target_tilt_position,
+                ATTR_SUPPORTED_FEATURES: self._attr_supported_features,
             }
         )
         return response
+
+    @property
+    def supported_features(self) -> CoverEntityFeature:
+        """Return supported features."""
+        return self._attr_supported_features
 
     def restore_external_state_attributes(
         self,
@@ -153,72 +137,7 @@ class Cover(PlatformEntity):
     def is_closing(self) -> bool:
         """Return if the cover is closing or not."""
         return self._state == STATE_CLOSING
-
-    @property
-    def current_cover_position(self) -> int | None:
-        """Return the current position of ZHA cover.
-
-        In HA None is unknown, 0 is closed, 100 is fully open.
-        In ZCL 0 is fully open, 100 is fully closed.
-        Keep in mind the values have already been flipped to match HA
-        in the WindowCovering cluster handler
-        """
-        return self._cover_cluster_handler.current_position_lift_percentage
-
-    @property
-    def current_cover_tilt_position(self) -> int | None:
-        """Return the current tilt position of the cover."""
-        return self._cover_cluster_handler.current_position_tilt_percentage
-
-    def _determine_supported_features(self) -> CoverEntityFeature:
-        """Determine the supported cover features."""
-        supported_features: CoverEntityFeature = (
-            CoverEntityFeature.OPEN
-            | CoverEntityFeature.CLOSE
-            | CoverEntityFeature.STOP
-            | CoverEntityFeature.SET_POSITION
-        )
-        if (
-            self._cover_cluster_handler.window_covering_type
-            and self._cover_cluster_handler.window_covering_type
-            in (
-                WCT.Shutter,
-                WCT.Tilt_blind_tilt_only,
-                WCT.Tilt_blind_tilt_and_lift,
-            )
-        ):
-            supported_features |= CoverEntityFeature.SET_TILT_POSITION
-            supported_features |= CoverEntityFeature.OPEN_TILT
-            supported_features |= CoverEntityFeature.CLOSE_TILT
-            supported_features |= CoverEntityFeature.STOP_TILT
-        return supported_features
-
-    def _determine_initial_state(self) -> None:
-        """Determine the initial state of the cover."""
-        if (
-            self._cover_cluster_handler.window_covering_type
-            and self._cover_cluster_handler.window_covering_type
-            in (
-                WCT.Shutter,
-                WCT.Tilt_blind_tilt_only,
-                WCT.Tilt_blind_tilt_and_lift,
-            )
-        ):
-            self._determine_state(
-                self.current_cover_tilt_position, is_lift_update=False
-            )
-            if (
-                self._cover_cluster_handler.window_covering_type
-                == WCT.Tilt_blind_tilt_and_lift
-            ):
-                state = self._state
-                self._determine_state(self.current_cover_position)
-                if state == STATE_OPEN and self._state == STATE_CLOSED:
-                    # let the tilt state override the lift state
-                    self._state = STATE_OPEN
-        else:
-            self._determine_state(self.current_cover_position)
-
+    
     def _determine_state(self, position_or_tilt, is_lift_update=True) -> None:
         """Determine the state of the cover.
 
@@ -248,27 +167,6 @@ class Cover(PlatformEntity):
             # we are mid transition and shouldn't update the state
             return
         self._state = STATE_OPEN
-
-    def handle_cluster_handler_attribute_updated(
-        self, event: ClusterAttributeUpdatedEvent
-    ) -> None:
-        """Handle position update from cluster handler."""
-        if event.attribute_id in (
-            WCAttrs.current_position_lift_percentage.id,
-            WCAttrs.current_position_tilt_percentage.id,
-        ):
-            value = (
-                self.current_cover_position
-                if event.attribute_id == WCAttrs.current_position_lift_percentage.id
-                else self.current_cover_tilt_position
-            )
-            self._determine_state(
-                value,
-                is_lift_update=(
-                    event.attribute_id == WCAttrs.current_position_lift_percentage.id
-                ),
-            )
-        self.maybe_emit_state_changed_event()
 
     def async_update_state(self, state):
         """Handle state update from HA operations below."""
@@ -357,6 +255,210 @@ class Cover(PlatformEntity):
         self._target_tilt_position = self.current_cover_tilt_position
         self._determine_state(self.current_cover_tilt_position, is_lift_update=False)
         self.maybe_emit_state_changed_event()
+
+
+@MULTI_MATCH(cluster_handler_names=CLUSTER_HANDLER_COVER)
+class Cover(PlatformEntity, BaseCover):
+    """Representation of a ZHA cover."""
+
+    PLATFORM = Platform.COVER
+
+    _attr_translation_key: str = "cover"
+    _attr_extra_state_attribute_names: set[str] = {
+        "target_lift_position",
+        "target_tilt_position",
+    }
+
+    def __init__(
+        self,
+        unique_id: str,
+        cluster_handlers: list[ClusterHandler],
+        endpoint: Endpoint,
+        device: Device,
+        **kwargs,
+    ) -> None:
+        """Init this cover."""
+        super().__init__(unique_id, cluster_handlers, endpoint, device, **kwargs)
+        cluster_handler = self.cluster_handlers.get(CLUSTER_HANDLER_COVER)
+        assert cluster_handler
+        self._cover_cluster_handler: WindowCoveringClusterHandler = cast(
+            WindowCoveringClusterHandler, cluster_handler
+        )
+        if self._cover_cluster_handler.window_covering_type:
+            self._attr_device_class: CoverDeviceClass | None = (
+                ZCL_TO_COVER_DEVICE_CLASS.get(
+                    self._cover_cluster_handler.window_covering_type
+                )
+            )
+        self._attr_supported_features: CoverEntityFeature = (
+            self._determine_supported_features()
+        )
+        self._determine_initial_state()
+        self._cover_cluster_handler.on_event(
+            CLUSTER_HANDLER_ATTRIBUTE_UPDATED,
+            self.handle_cluster_handler_attribute_updated,
+        )
+
+    @property
+    def current_cover_position(self) -> int | None:
+        """Return the current position of ZHA cover.
+
+        In HA None is unknown, 0 is closed, 100 is fully open.
+        In ZCL 0 is fully open, 100 is fully closed.
+        Keep in mind the values have already been flipped to match HA
+        in the WindowCovering cluster handler
+        """
+        return self._cover_cluster_handler.current_position_lift_percentage
+
+    @property
+    def current_cover_tilt_position(self) -> int | None:
+        """Return the current tilt position of the cover."""
+        return self._cover_cluster_handler.current_position_tilt_percentage
+
+    def _determine_supported_features(self) -> CoverEntityFeature:
+        """Determine the supported cover features."""
+        supported_features: CoverEntityFeature = (
+            CoverEntityFeature.OPEN
+            | CoverEntityFeature.CLOSE
+            | CoverEntityFeature.STOP
+            | CoverEntityFeature.SET_POSITION
+        )
+        if (
+            self._cover_cluster_handler.window_covering_type
+            and self._cover_cluster_handler.window_covering_type
+            in (
+                WCT.Shutter,
+                WCT.Tilt_blind_tilt_only,
+                WCT.Tilt_blind_tilt_and_lift,
+            )
+        ):
+            supported_features |= CoverEntityFeature.SET_TILT_POSITION
+            supported_features |= CoverEntityFeature.OPEN_TILT
+            supported_features |= CoverEntityFeature.CLOSE_TILT
+            supported_features |= CoverEntityFeature.STOP_TILT
+        return supported_features
+
+    def _determine_initial_state(self) -> None:
+        """Determine the initial state of the cover."""
+        if (
+            self._cover_cluster_handler.window_covering_type
+            and self._cover_cluster_handler.window_covering_type
+            in (
+                WCT.Shutter,
+                WCT.Tilt_blind_tilt_only,
+                WCT.Tilt_blind_tilt_and_lift,
+            )
+        ):
+            self._determine_state(
+                self.current_cover_tilt_position, is_lift_update=False
+            )
+            if (
+                self._cover_cluster_handler.window_covering_type
+                == WCT.Tilt_blind_tilt_and_lift
+            ):
+                state = self._state
+                self._determine_state(self.current_cover_position)
+                if state == STATE_OPEN and self._state == STATE_CLOSED:
+                    # let the tilt state override the lift state
+                    self._state = STATE_OPEN
+        else:
+            self._determine_state(self.current_cover_position)
+
+    def handle_cluster_handler_attribute_updated(
+        self, event: ClusterAttributeUpdatedEvent
+    ) -> None:
+        """Handle position update from cluster handler."""
+        if event.attribute_id in (
+            WCAttrs.current_position_lift_percentage.id,
+            WCAttrs.current_position_tilt_percentage.id,
+        ):
+            value = (
+                self.current_cover_position
+                if event.attribute_id == WCAttrs.current_position_lift_percentage.id
+                else self.current_cover_tilt_position
+            )
+            self._determine_state(
+                value,
+                is_lift_update=(
+                    event.attribute_id == WCAttrs.current_position_lift_percentage.id
+                ),
+            )
+        self.maybe_emit_state_changed_event()
+
+
+@GROUP_MATCH()
+class CoverGroup(GroupEntity, BaseCover):
+    """Representation of a cover group."""
+
+    def __init__(self, group: Group):
+        """Initialize a cover group."""
+        super().__init__(group)
+
+        # Use the group endpoint for all commands implemented in the BaseCover class
+        self._cover_cluster_handler = group.zigpy_group.endpoint[
+            WindowCovering.cluster_id
+        ]
+
+        # For CoverGroup we store a local representation of the current positions
+        self._attr_current_position_lift_percentage: int | None
+        self._attr_current_position_tilt_percentage: int | None
+
+        if hasattr(self, "info_object"):
+            delattr(self, "info_object")
+        self.update()
+
+    def update(self, _: Any = None) -> None:
+        """Query all members and determine the cover group state."""
+        self.debug("Updating cover group entity state")
+        platform_entities = self._group.get_platform_entities(self.PLATFORM)
+        all_states = [entity.state for entity in platform_entities]
+        states: list = list(filter(None, all_states))
+        self.debug(
+            "All platform entity states for group entity members: %s", all_states
+        )
+
+        valid_positions: list = list(find_state_attributes(states, ATTR_CURRENT_POSITION))
+        valid_tilts: list = list(find_state_attributes(states, ATTR_CURRENT_TILT_POSITION))
+
+        # Simply average the current positions and tilts from all entities
+        self._attr_current_position_lift_percentage = (None if len(valid_positions) == 0 else mean_int(valid_positions))
+        self._attr_current_position_tilt_percentage = (None if len(valid_tilts) == 0 else mean_int(valid_tilts))
+
+        self._attr_supported_features = CoverEntityFeature(0)
+        for support in find_state_attributes(states, ATTR_SUPPORTED_FEATURES):
+            # Merge supported features by emulating support for every feature
+            # we find.
+            self._attr_supported_features |= support
+        # Bitwise-and the supported features with the CoverGroup's features
+        # so that we don't break in the future when a new feature is added.
+        self._attr_supported_features &= (
+            CoverEntityFeature.OPEN |
+            CoverEntityFeature.CLOSE |
+            CoverEntityFeature.SET_POSITION |
+            CoverEntityFeature.STOP |
+            CoverEntityFeature.OPEN_TILT |
+            CoverEntityFeature.CLOSE_TILT |
+            CoverEntityFeature.STOP_TILT |
+            CoverEntityFeature.SET_TILT_POSITION
+        )
+
+        self.maybe_emit_state_changed_event()
+
+    @property
+    def current_cover_position(self) -> int | None:
+        """Return the current position of ZHA cover.
+
+        In HA None is unknown, 0 is closed, 100 is fully open.
+        In ZCL 0 is fully open, 100 is fully closed.
+        Keep in mind the values have already been flipped to match HA
+        in the WindowCovering cluster handler
+        """
+        return self._attr_current_position_lift_percentage
+
+    @property
+    def current_cover_tilt_position(self) -> int | None:
+        """Return the current tilt position of the cover."""
+        return self._attr_current_position_tilt_percentage
 
 
 @MULTI_MATCH(
